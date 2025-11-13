@@ -1,0 +1,12 @@
+pandas
+torch
+transformers
+rich
+sentence-transformers
+textstat
+regex
+tiktoken
+accelerate
+ipywidgets
+ipykernel
+gradio
