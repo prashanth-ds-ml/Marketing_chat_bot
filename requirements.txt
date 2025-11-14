@@ -10,3 +10,6 @@ accelerate
 ipywidgets
 ipykernel
 gradio
+langchain
+langchain-core
+langchain-community

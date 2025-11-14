@@ -3,7 +3,7 @@ Gradio UI for Marketeer (copy + video script).
 
 This file wires the core logic into a simple web interface
 with two tabs:
-- Copy Generator (one-shot + chat-style)
+- Copy Generator
 - Video Script Generator
 """
 
@@ -13,7 +13,6 @@ import gradio as gr
 
 from core_logic.copy_pipeline import CopyRequest, generate_copy
 from core_logic.video_pipeline import VideoRequest, generate_video_script
-from core_logic.chat_chain import chat_turn
 
 
 # ----- Backend wrapper functions for Gradio -----
@@ -30,8 +29,8 @@ def _generate_copy_ui(
     extra_context: str,
 ):
     """
-    One-shot copy generation using the template fields only.
-    Returns final_text and raw_text (for hidden debug).
+    Wrapper around generate_copy() for Gradio.
+    Returns final_text, raw_text, audit_text in that order.
     """
     req = CopyRequest(
         brand=brand or "",
@@ -46,54 +45,18 @@ def _generate_copy_ui(
 
     resp = generate_copy(req)
 
-    # We keep audit internal; just return final and raw
-    return resp.final, resp.raw
+    # Pretty-print audit log
+    if resp.audit:
+        audit_lines = []
+        for item in resp.audit:
+            rule = item.get("rule", "unknown")
+            audit_lines.append(f"- {rule}: {item}")
+        audit_text = "\n".join(audit_lines)
+    else:
+        audit_text = "No edits were needed. ✅"
 
-
-def _chat_copy_ui(
-    chat_history,
-    user_message: str,
-    brand: str,
-    product: str,
-    audience: str,
-    goal: str,
-    platform_name: str,
-    tone: str,
-    cta_style: str,
-    extra_context: str,
-):
-    """
-    Chat handler for the Copy tab using LangChain PromptTemplate + MarketeerLLM.
-
-    - Uses campaign context (brand, product, audience, goal, platform, tone, CTA)
-    - Uses chat_history (list of [user, assistant] pairs) as previous conversation
-    """
-    if not user_message or not user_message.strip():
-        return chat_history, user_message
-
-    req = CopyRequest(
-        brand=brand or "",
-        product=product or "",
-        audience=audience or "",
-        goal=goal or "",
-        platform_name=platform_name or "Instagram",
-        tone=tone or "friendly",
-        cta_style=cta_style or "soft",
-        extra_context=extra_context or "",
-    )
-
-    history_pairs = chat_history or []
-
-    final_text, raw_text, audit = chat_turn(
-        req=req,
-        user_message=user_message,
-        history_pairs=history_pairs,
-    )
-
-    new_history = history_pairs + [[user_message, final_text]]
-
-    # We ignore raw_text + audit in UI, but they’re there if you want logging
-    return new_history, ""
+    # RETURN IN ORDER: final_copy, raw_output, audit_log
+    return resp.final, resp.raw, audit_text
 
 
 def _generate_video_ui(
@@ -107,10 +70,10 @@ def _generate_video_ui(
     style: str,
     extra_context: str,
     debug_first: bool,
-) -> Dict[str, Any]:
+):
     """
     Wrapper around generate_video_script() for Gradio.
-    Returns storyboard text, JSON, and warnings.
+    Returns storyboard_text, script_json, warnings_text in that order.
     """
     req = VideoRequest(
         brand=brand or "",
@@ -126,8 +89,8 @@ def _generate_video_ui(
 
     resp = generate_video_script(req, debug_first=bool(debug_first))
 
-    # Build a human-readable storyboard
-    sb_lines: List[str] = []
+    # storyboard text (same as before)
+    sb_lines = []
     for block in resp.beats:
         sb_lines.append(
             f"Beat {block['beat_index'] + 1}: {block['beat_title']} "
@@ -144,18 +107,18 @@ def _generate_video_ui(
         sb_lines.append("  Captions:")
         for cap in block["captions"]:
             sb_lines.append(f"    • {cap}")
-        sb_lines.append("")  # blank line between beats
+        sb_lines.append("")
 
     storyboard_text = "\n".join(sb_lines).strip() or "No beats generated."
 
-    # Warnings text
+    # warnings text
     if resp.warnings:
         warnings_text = "\n".join(f"- {w}" for w in resp.warnings)
     else:
         warnings_text = "No warnings. All beats parsed without fallback. ✅"
 
-    # JSON-ready object
-    script_json: Dict[str, Any] = {
+    # JSON object
+    script_json = {
         "plan": {
             "blueprint_name": resp.plan.blueprint_name,
             "duration_sec": resp.plan.duration_sec,
@@ -176,11 +139,8 @@ def _generate_video_ui(
         "warnings": resp.warnings,
     }
 
-    return {
-        "storyboard_text": storyboard_text,
-        "script_json": script_json,
-        "warnings_text": warnings_text,
-    }
+    # RETURN IN ORDER: storyboard, json, warnings
+    return storyboard_text, script_json, warnings_text
 
 
 # ----- Gradio layout -----
@@ -196,7 +156,7 @@ def create_interface() -> gr.Blocks:
 # Marketeer – Copy & Video Script Generator
 
 Generate platform-aware marketing copy and short-form video scripts,
-with both one-shot and chat-style refinement, powered by your Gemma backend.
+powered by your patched Gemma-based backend.
 """
         )
 
@@ -204,7 +164,6 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
             # --- Tab 1: Copy Generator ---
             with gr.Tab("Copy Generator"):
                 with gr.Row():
-                    # LEFT COLUMN: Template fields
                     with gr.Column():
                         brand = gr.Textbox(
                             label="Brand / Company",
@@ -245,42 +204,24 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                             lines=3,
                         )
 
-                        generate_copy_btn = gr.Button("Generate Copy (one-shot)")
+                        generate_copy_btn = gr.Button("Generate Copy")
 
-                    # RIGHT COLUMN: One-shot result + Chatbot
                     with gr.Column():
                         final_copy = gr.Textbox(
-                            label="Final Copy (one-shot generator)",
-                            lines=6,
+                            label="Final Copy",
+                            lines=10,
                         )
-
-                        chatbox = gr.Chatbot(
-                            label="Copy Chat (context-aware)",
-                            height=300,
+                        audit_log = gr.Textbox(
+                            label="Audit Log",
+                            lines=8,
                         )
-                        user_msg = gr.Textbox(
-                            label="Your message",
-                            placeholder=(
-                                "Ask me to write or edit the copy.\n"
-                                "Examples:\n"
-                                "- 'Write a first version for Instagram.'\n"
-                                "- 'Shorten the last post and make it funnier.'\n"
-                                "- 'Adapt this for LinkedIn, more professional.'"
-                            ),
-                            lines=3,
-                        )
-                        with gr.Row():
-                            send_btn = gr.Button("Send")
-                            clear_btn = gr.Button("Clear Chat")
-
-                        # Hidden raw output for debug if needed
                         raw_output = gr.Textbox(
                             label="Raw Model Output (debug)",
-                            lines=4,
-                            visible=False,
+                            lines=8,
+                            visible=False,  # flip to True if you want to see raw text
                         )
 
-                # Wire one-shot copy button
+                # Wire copy button
                 generate_copy_btn.click(
                     fn=_generate_copy_ui,
                     inputs=[
@@ -293,35 +234,7 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                         cta_style,
                         extra_context,
                     ],
-                    outputs=[final_copy, raw_output],
-                )
-
-                # Wire chat send button
-                send_btn.click(
-                    fn=_chat_copy_ui,
-                    inputs=[
-                        chatbox,
-                        user_msg,
-                        brand,
-                        product,
-                        audience,
-                        goal,
-                        platform_name,
-                        tone,
-                        cta_style,
-                        extra_context,
-                    ],
-                    outputs=[chatbox, user_msg],
-                )
-
-                # Wire chat clear button
-                def _clear_chat():
-                    return []
-
-                clear_btn.click(
-                    fn=_clear_chat,
-                    inputs=None,
-                    outputs=chatbox,
+                    outputs=[final_copy, raw_output, audit_log],
                 )
 
             # --- Tab 2: Video Script Generator ---
