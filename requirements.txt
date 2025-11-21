@@ -13,3 +13,5 @@ gradio
 langchain
 langchain-core
 langchain-community
+langchain-huggingface
+bitsandbytes
