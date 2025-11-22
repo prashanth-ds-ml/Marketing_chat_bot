@@ -1,10 +1,15 @@
 """
 Gradio UI for Marketeer (copy + video script).
 
-This file wires the core logic into a simple web interface
-with two tabs:
-- Copy Generator (one-shot + chat-style)
-- Video Script Generator
+New UX:
+
+- User fills the campaign form (brand, product, audience, goal, platform, tone, CTA, extra context).
+- Clicking "Generate Copy" creates a FIRST DRAFT and shows it as an assistant
+  message in a single chat interface.
+- The user then continues the conversation in that SAME chat window
+  (no separate one-shot box / separate draft box).
+- Feedback is linked to the LAST assistant response via a simple
+  rating + comment section under the chat.
 """
 
 from typing import Any, Dict, List
@@ -16,28 +21,58 @@ from core_logic.video_pipeline import VideoRequest, generate_video_script
 from core_logic.chat_chain import chat_turn
 
 
+# ----- Small helpers -----
+
+
+def _build_goal_text(goal_preset: str, goal_custom: str) -> str:
+    """
+    Combine a preset goal (dropdown) with an optional custom goal.
+
+    Examples:
+    - "Increase brand awareness" + "" -> "Increase brand awareness"
+    - "Promote in-store visits" + "for this weekend only" ->
+        "Promote in-store visits — for this weekend only"
+    - "" + "Drive repeat app installs" -> "Drive repeat app installs"
+    """
+    goal_preset = (goal_preset or "").strip()
+    goal_custom = (goal_custom or "").strip()
+
+    if goal_preset and goal_custom:
+        return f"{goal_preset} — {goal_custom}"
+    if goal_custom:
+        return goal_custom
+    return goal_preset
+
+
 # ----- Backend wrapper functions for Gradio -----
 
 
-def _generate_copy_ui(
+def _generate_first_copy_ui(
     brand: str,
     product: str,
     audience: str,
-    goal: str,
+    goal_preset: str,
+    goal_custom: str,
     platform_name: str,
     tone: str,
     cta_style: str,
     extra_context: str,
 ):
     """
-    One-shot copy generation using the template fields only.
-    Returns final_text and raw_text (for hidden debug).
+    First-step copy generation using the form fields.
+    The result is shown as the FIRST assistant message in the chat.
+
+    Returns:
+    - chat_history: list of [user, assistant] pairs for the Chatbot component
+      Here we start with a single assistant message containing the first draft.
     """
+    goal_text = _build_goal_text(goal_preset, goal_custom)
+
     req = CopyRequest(
         brand=brand or "",
         product=product or "",
         audience=audience or "",
-        goal=goal or "",
+        goal=goal_text or "",
         platform_name=platform_name or "Instagram",
         tone=tone or "friendly",
         cta_style=cta_style or "soft",
@@ -46,8 +81,14 @@ def _generate_copy_ui(
 
     resp = generate_copy(req)
 
-    # We keep audit internal; just return final and raw
-    return resp.final, resp.raw
+    first_post = (resp.final or "").strip()
+    if not first_post:
+        first_post = "I tried to generate a post, but the result was empty. Please try again."
+
+    # Seed chat: one assistant message with the first draft
+    chat_history: List[List[str]] = [["", first_post]]
+
+    return chat_history
 
 
 def _chat_copy_ui(
@@ -56,26 +97,31 @@ def _chat_copy_ui(
     brand: str,
     product: str,
     audience: str,
-    goal: str,
+    goal_preset: str,
+    goal_custom: str,
     platform_name: str,
     tone: str,
     cta_style: str,
     extra_context: str,
 ):
     """
-    Chat handler for the Copy tab using LangChain PromptTemplate + MarketeerLLM.
+    Chat handler for the Copy tab using LangChain PromptTemplate + Marketeer LLM.
 
     - Uses campaign context (brand, product, audience, goal, platform, tone, CTA)
     - Uses chat_history (list of [user, assistant] pairs) as previous conversation
+    - Returns updated chat_history and clears the input box.
     """
     if not user_message or not user_message.strip():
+        # Nothing to do; keep chat as is, don't clear the textbox
         return chat_history, user_message
+
+    goal_text = _build_goal_text(goal_preset, goal_custom)
 
     req = CopyRequest(
         brand=brand or "",
         product=product or "",
         audience=audience or "",
-        goal=goal or "",
+        goal=goal_text or "",
         platform_name=platform_name or "Instagram",
         tone=tone or "friendly",
         cta_style=cta_style or "soft",
@@ -92,8 +138,65 @@ def _chat_copy_ui(
 
     new_history = history_pairs + [[user_message, final_text]]
 
-    # We ignore raw_text + audit in UI, but they’re there if you want logging
+    # Return updated chat history and clear user input
     return new_history, ""
+
+
+def _clear_chat():
+    """
+    Clear chat history.
+    """
+    return []
+
+
+def _submit_feedback_for_last_reply(
+    chat_history,
+    fb_rating: str,
+    fb_text: str,
+    brand: str,
+    platform_name: str,
+    goal_preset: str,
+    goal_custom: str,
+):
+    """
+    Feedback handler tied to the LAST assistant message in the chat.
+
+    We log:
+    - Brand, Platform, Goal
+    - Rating (e.g., 👍 / 👎)
+    - Free-text feedback
+    - The last assistant reply text
+
+    and return a short status message.
+    """
+    if not chat_history:
+        return "No messages yet. Generate a post or chat first, then leave feedback."
+
+    # chat_history is a list of [user, assistant] pairs.
+    # The last pair's assistant message is the one we care about.
+    last_user, last_assistant = chat_history[-1]
+    last_assistant = last_assistant or "(empty reply)"
+
+    fb_rating = fb_rating or "(not provided)"
+    fb_text = fb_text or "(no comment)"
+    brand = brand or "(not provided)"
+    platform_name = platform_name or "(not provided)"
+
+    goal_text = _build_goal_text(goal_preset, goal_custom)
+    goal_text = goal_text or "(not provided)"
+
+    print("=== MARKETEER FEEDBACK (last reply) ===")
+    print(f"Brand: {brand}")
+    print(f"Platform: {platform_name}")
+    print(f"Goal: {goal_text}")
+    print(f"Rating: {fb_rating}")
+    print("User feedback text:")
+    print(fb_text)
+    print("--- Last assistant reply ---")
+    print(last_assistant)
+    print("=======================================")
+
+    return "✅ Thanks for your feedback on the last reply!"
 
 
 def _generate_video_ui(
@@ -195,17 +298,20 @@ def create_interface() -> gr.Blocks:
             """
 # Marketeer – Copy & Video Script Generator
 
-Generate platform-aware marketing copy and short-form video scripts,
-with both one-shot and chat-style refinement, powered by your Gemma backend.
+Fill in your campaign details, generate a first draft, then refine it
+in a single chat with your AI copywriter. Also generate short-form video
+storyboards for your campaigns.
 """
         )
 
         with gr.Tabs():
-            # --- Tab 1: Copy Generator ---
-            with gr.Tab("Copy Generator"):
+            # --- Tab 1: Copy Chat (single chat interface) ---
+            with gr.Tab("Copy Chat"):
                 with gr.Row():
-                    # LEFT COLUMN: Template fields
-                    with gr.Column():
+                    # LEFT COLUMN: Campaign setup
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Campaign Setup")
+
                         brand = gr.Textbox(
                             label="Brand / Company",
                             placeholder="Brew Bliss Café",
@@ -216,11 +322,28 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                         )
                         audience = gr.Textbox(
                             label="Target audience",
-                            placeholder="young professionals who love coffee but hate waiting in line",
+                            placeholder=(
+                                "young professionals who love coffee but hate waiting in line"
+                            ),
                         )
-                        goal = gr.Textbox(
+
+                        # Campaign goal: preset dropdown + optional custom
+                        goal_preset = gr.Dropdown(
                             label="Campaign goal",
-                            placeholder="drive in-store visits this weekend",
+                            choices=[
+                                "Increase brand awareness",
+                                "Lead generation",
+                                "Drive website traffic",
+                                "Promote in-store visits",
+                                "Boost engagement",
+                                "Announce a new product",
+                            ],
+                            value="Increase brand awareness",
+                        )
+                        goal_custom = gr.Textbox(
+                            label="Custom goal (optional)",
+                            placeholder="e.g. drive in-store visits this weekend",
+                            lines=2,
                         )
 
                         platform_name = gr.Dropdown(
@@ -230,7 +353,12 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                         )
                         tone = gr.Dropdown(
                             label="Tone",
-                            choices=["friendly", "professional", "energetic", "storytelling"],
+                            choices=[
+                                "friendly",
+                                "professional",
+                                "energetic",
+                                "storytelling",
+                            ],
                             value="friendly",
                         )
                         cta_style = gr.Dropdown(
@@ -245,26 +373,24 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                             lines=3,
                         )
 
-                        generate_copy_btn = gr.Button("Generate Copy (one-shot)")
-
-                    # RIGHT COLUMN: One-shot result + Chatbot
-                    with gr.Column():
-                        final_copy = gr.Textbox(
-                            label="Final Copy (one-shot generator)",
-                            lines=6,
+                        generate_copy_btn = gr.Button(
+                            "✨ Generate First Draft (and start chat)"
                         )
+
+                    # RIGHT COLUMN: Chat + Feedback
+                    with gr.Column(scale=2):
+                        gr.Markdown("### Chat with your copywriter")
 
                         chatbox = gr.Chatbot(
                             label="Copy Chat (context-aware)",
-                            height=300,
+                            height=320,
                         )
                         user_msg = gr.Textbox(
                             label="Your message",
                             placeholder=(
-                                "Ask me to write or edit the copy.\n"
                                 "Examples:\n"
-                                "- 'Write a first version for Instagram.'\n"
-                                "- 'Shorten the last post and make it funnier.'\n"
+                                "- 'Write a first post for this campaign.'\n"
+                                "- 'Shorten this and keep the main message.'\n"
                                 "- 'Adapt this for LinkedIn, more professional.'"
                             ),
                             lines=3,
@@ -273,27 +399,35 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                             send_btn = gr.Button("Send")
                             clear_btn = gr.Button("Clear Chat")
 
-                        # Hidden raw output for debug if needed
-                        raw_output = gr.Textbox(
-                            label="Raw Model Output (debug)",
-                            lines=4,
-                            visible=False,
+                        gr.Markdown("#### Feedback on the last reply")
+                        fb_rating = gr.Radio(
+                            label="How was the last AI reply?",
+                            choices=["👍 Helpful", "👌 Okay", "👎 Needs improvement"],
+                            value="👍 Helpful",
                         )
+                        fb_text = gr.Textbox(
+                            label="Feedback (optional)",
+                            placeholder="What worked well? What should be improved?",
+                            lines=3,
+                        )
+                        fb_submit = gr.Button("Submit feedback for last reply")
+                        fb_status = gr.Markdown("")
 
-                # Wire one-shot copy button
+                # Wire first-draft generator (seeds chat only)
                 generate_copy_btn.click(
-                    fn=_generate_copy_ui,
+                    fn=_generate_first_copy_ui,
                     inputs=[
                         brand,
                         product,
                         audience,
-                        goal,
+                        goal_preset,
+                        goal_custom,
                         platform_name,
                         tone,
                         cta_style,
                         extra_context,
                     ],
-                    outputs=[final_copy, raw_output],
+                    outputs=[chatbox],
                 )
 
                 # Wire chat send button
@@ -305,7 +439,8 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                         brand,
                         product,
                         audience,
-                        goal,
+                        goal_preset,
+                        goal_custom,
                         platform_name,
                         tone,
                         cta_style,
@@ -315,16 +450,28 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                 )
 
                 # Wire chat clear button
-                def _clear_chat():
-                    return []
-
                 clear_btn.click(
                     fn=_clear_chat,
                     inputs=None,
-                    outputs=chatbox,
+                    outputs=[chatbox],
                 )
 
-            # --- Tab 2: Video Script Generator ---
+                # Wire feedback button (linked to last assistant reply)
+                fb_submit.click(
+                    fn=_submit_feedback_for_last_reply,
+                    inputs=[
+                        chatbox,
+                        fb_rating,
+                        fb_text,
+                        brand,
+                        platform_name,
+                        goal_preset,
+                        goal_custom,
+                    ],
+                    outputs=[fb_status],
+                )
+
+            # --- Tab 2: Video Script Generator (unchanged logic) ---
             with gr.Tab("Video Script Generator"):
                 with gr.Row():
                     with gr.Column():
@@ -338,7 +485,9 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                         )
                         v_audience = gr.Textbox(
                             label="Target audience",
-                            placeholder="young professionals who love coffee but hate waiting in line",
+                            placeholder=(
+                                "young professionals who love coffee but hate waiting in line"
+                            ),
                         )
                         v_goal = gr.Textbox(
                             label="Campaign goal",
@@ -367,7 +516,9 @@ with both one-shot and chat-style refinement, powered by your Gemma backend.
                         )
                         extra_context_v = gr.Textbox(
                             label="Extra context (optional)",
-                            placeholder="Focus on escaping the grind and enjoying a chilled moment.",
+                            placeholder=(
+                                "Focus on escaping the grind and enjoying a chilled moment."
+                            ),
                             lines=3,
                         )
                         debug_first = gr.Checkbox(

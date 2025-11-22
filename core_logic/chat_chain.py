@@ -8,7 +8,8 @@ We use:
 
 We DO NOT use SystemMessage, because the current model's chat template
 does not support a "system" role. Instead, we fold all instructions and
-campaign context into a single HumanMessage prompt.
+campaign context into a single HumanMessage prompt, including platform
+style guidelines (Phase 3).
 """
 
 from typing import List, Tuple
@@ -18,8 +19,12 @@ from langchain_core.messages import HumanMessage
 
 from core_logic.llm_config import get_local_chat_model
 from .copy_pipeline import CopyRequest
-from helpers.platform_rules import PLATFORM_RULES, DEFAULT_PLATFORM_NAME, PlatformConfig
-from helpers.platform_styles import get_platform_style
+from helpers.platform_rules import (
+    PLATFORM_RULES,
+    DEFAULT_PLATFORM_NAME,
+    PlatformConfig,
+    get_platform_style,
+)
 from helpers.validators import validate_and_edit
 
 
@@ -32,10 +37,9 @@ def _get_platform_config(name: str) -> PlatformConfig:
 def build_chat_prompt_template() -> PromptTemplate:
     """
     Template takes:
-    - brand, product, audience, goal, platform
-    - tone, cta_style, extra_context
+    - brand, product, audience, goal, platform, tone, cta_style, extra_context
     - char_cap
-    - platform_style (formatted description)
+    - style_voice, style_emoji_guideline, style_hashtag_guideline, style_length_guideline
     - history (chat transcript as text)
     - input (latest user message)
     """
@@ -48,15 +52,16 @@ Campaign context:
 - Product/Offer: {product}
 - Target audience: {audience}
 - Campaign goal: {goal}
-- Preferred tone: {tone}
+- Tone requested by user: {tone}
 - Call-to-action style: {cta_style}
-- Extra context: {extra_context}
+- Extra context from the user: {extra_context}
 
-Platform style guidelines:
-{platform_style}
-
-Keep the final post within approximately {char_cap} characters,
-and make it engaging but natural.
+Platform style guidelines for {platform}:
+- Voice and personality: {style_voice}
+- Emojis: {style_emoji_guideline}
+- Hashtags: {style_hashtag_guideline}
+- Length: {style_length_guideline}
+- Character limit: approximately {char_cap} characters.
 
 Here is the conversation so far between you and the user
 about this campaign:
@@ -66,9 +71,14 @@ about this campaign:
 Now the user says:
 {input}
 
+Your task:
+- Follow the platform style guidelines and tone.
+- Respect the character limit as much as reasonably possible.
+- If the user asks to edit or adapt an existing post, transform it accordingly.
+- Do NOT include explanations, analysis, or labels in your answer.
+
 Respond with ONLY the post text or edited post text
-the user asked for. Do not include explanations, analysis, or labels.
-Just the post.
+the user asked for. Do not add any extra commentary.
 """
     return PromptTemplate(
         input_variables=[
@@ -81,7 +91,10 @@ Just the post.
             "cta_style",
             "extra_context",
             "char_cap",
-            "platform_style",
+            "style_voice",
+            "style_emoji_guideline",
+            "style_hashtag_guideline",
+            "style_length_guideline",
             "history",
             "input",
         ],
@@ -105,24 +118,6 @@ def _format_history(history_pairs: List[Tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def _format_platform_style(platform_name: str) -> str:
-    """
-    Get a human-readable style description for the given platform.
-    """
-    style = get_platform_style(platform_name)
-
-    lines = [
-        f"- Platform: {style.name}",
-        f"- Voice: {style.voice}",
-        f"- Emojis: {style.emoji_guideline}",
-        f"- Hashtags: {style.hashtag_guideline}",
-        f"- Formatting: {style.formatting_guideline}",
-    ]
-    if style.extra_notes:
-        lines.append(f"- Extra notes: {style.extra_notes}")
-    return "\n".join(lines)
-
-
 def chat_turn(
     req: CopyRequest,
     user_message: str,
@@ -133,11 +128,12 @@ def chat_turn(
 
     - Uses LangChain PromptTemplate + ChatHuggingFace (via get_local_chat_model)
     - Uses history_pairs (from Gradio Chatbot) as conversation history
-    - Applies validators (banned terms, char caps)
+    - Applies platform style guidelines (Phase 3)
+    - Applies validators (banned terms, char caps, etc.)
     - Returns final_text, raw_text, audit
     """
     platform_cfg = _get_platform_config(req.platform_name)
-    platform_style_text = _format_platform_style(req.platform_name)
+    style = get_platform_style(req.platform_name)
 
     prompt_tmpl = build_chat_prompt_template()
     history_text = _format_history(history_pairs)
@@ -148,12 +144,17 @@ def chat_turn(
         product=req.product or "",
         audience=req.audience or "",
         goal=req.goal or "",
-        platform=platform_cfg.name,
+        platform=style.get("name", req.platform_name or "Unknown platform"),
         tone=req.tone or "friendly",
         cta_style=req.cta_style or "soft",
         extra_context=req.extra_context or "",
-        char_cap=str(platform_cfg.char_cap),
-        platform_style=platform_style_text,
+        char_cap=str(platform_cfg.cap)
+        if hasattr(platform_cfg, "cap")
+        else str(getattr(platform_cfg, "char_cap", 280)),
+        style_voice=style.get("voice", ""),
+        style_emoji_guideline=style.get("emoji_guideline", ""),
+        style_hashtag_guideline=style.get("hashtag_guideline", ""),
+        style_length_guideline=style.get("length_guideline", ""),
         history=history_text,
         input=user_message,
     )
@@ -163,7 +164,7 @@ def chat_turn(
     ai_msg = chat_model.invoke([HumanMessage(content=prompt_str)])
     raw_text = ai_msg.content
 
-    # Apply your existing validators (banned phrases, length caps, etc.)
+    # Apply your existing validators (banned phrases, length, etc.)
     final_text, audit = validate_and_edit(raw_text, platform_cfg)
 
     return final_text, raw_text, audit
