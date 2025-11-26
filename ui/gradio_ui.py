@@ -18,7 +18,11 @@ import gradio as gr
 
 from core_logic.copy_pipeline import CopyRequest, generate_copy
 from core_logic.video_pipeline import VideoRequest, generate_video_script
-from core_logic.chat_chain import chat_turn
+# from core_logic.chat_chain import chat_turn
+from core_logic.chat_agent import agent_chat_turn
+from core_logic.copy_pipeline import CopyRequest
+
+
 
 
 # ----- Small helpers -----
@@ -26,22 +30,16 @@ from core_logic.chat_chain import chat_turn
 
 def _build_goal_text(goal_preset: str, goal_custom: str) -> str:
     """
-    Combine a preset goal (dropdown) with an optional custom goal.
+    Combine preset and custom goal fields into one text.
 
-    Examples:
-    - "Increase brand awareness" + "" -> "Increase brand awareness"
-    - "Promote in-store visits" + "for this weekend only" ->
-        "Promote in-store visits — for this weekend only"
-    - "" + "Drive repeat app installs" -> "Drive repeat app installs"
+    Logic:
+    - If custom goal is provided, use that.
+    - Else, use the preset goal (dropdown).
+    - Else, empty string.
     """
-    goal_preset = (goal_preset or "").strip()
     goal_custom = (goal_custom or "").strip()
-
-    if goal_preset and goal_custom:
-        return f"{goal_preset} — {goal_custom}"
-    if goal_custom:
-        return goal_custom
-    return goal_preset
+    goal_preset = (goal_preset or "").strip()
+    return goal_custom or goal_preset or ""
 
 
 # ----- Backend wrapper functions for Gradio -----
@@ -105,40 +103,61 @@ def _chat_copy_ui(
     extra_context: str,
 ):
     """
-    Chat handler for the Copy tab using LangChain PromptTemplate + Marketeer LLM.
+    Chat handler for the Copy tab using the advanced agent with tools.
+
+    Parameters must match the order of inputs in send_btn.click():
+
+        inputs=[
+            chatbox,
+            user_msg,
+            brand,
+            product,
+            audience,
+            goal_preset,
+            goal_custom,
+            platform_name,
+            tone,
+            cta_style,
+            extra_context,
+        ]
 
     - Uses campaign context (brand, product, audience, goal, platform, tone, CTA)
     - Uses chat_history (list of [user, assistant] pairs) as previous conversation
     - Returns updated chat_history and clears the input box.
     """
+    # If user_message is empty, just return the same state
     if not user_message or not user_message.strip():
-        # Nothing to do; keep chat as is, don't clear the textbox
         return chat_history, user_message
 
+    # Merge preset + custom goal into a single text
     goal_text = _build_goal_text(goal_preset, goal_custom)
 
+    # Build the CopyRequest from the form fields
     req = CopyRequest(
         brand=brand or "",
         product=product or "",
         audience=audience or "",
-        goal=goal_text or "",
+        goal=goal_text,
         platform_name=platform_name or "Instagram",
         tone=tone or "friendly",
         cta_style=cta_style or "soft",
         extra_context=extra_context or "",
     )
 
+    # Gradio Chatbot history comes in as list of [user, assistant] pairs
     history_pairs = chat_history or []
 
-    final_text, raw_text, audit = chat_turn(
+    # Call our advanced agent (which can use rewrite tools internally)
+    final_text, raw_text, audit = agent_chat_turn(
         req=req,
         user_message=user_message,
         history_pairs=history_pairs,
     )
 
+    # Append the new turn to history
     new_history = history_pairs + [[user_message, final_text]]
 
-    # Return updated chat history and clear user input
+    # Return updated history and clear the input box
     return new_history, ""
 
 
