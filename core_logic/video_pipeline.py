@@ -1,37 +1,40 @@
-"""
-Video planning and scripting pipeline for Marketeer.
+# core_logic/video_pipeline.py
 
-High level:
-- plan_video() turns a blueprint + duration into timed beats.
-- script_video_from_plan() calls the LLM beat-by-beat with JSON instructions.
-- generate_video_script() is the main public entry point.
+"""
+Video script generation pipeline for Marketeer.
+
+Phase 5: Use a structured Pydantic schema (VideoScriptResponse)
+while keeping the external behaviour compatible with the existing UI.
+
+High-level flow:
+1. Build a simple beat plan based on blueprint + duration.
+2. For each beat, ask the LLM for a JSON block with:
+   - voiceover
+   - on_screen
+   - shots
+   - broll
+   - captions
+3. Parse JSON into VideoBeat models.
+4. Return a VideoScriptResponse (plan + warnings).
 """
 
+from __future__ import annotations
+
+import json
 from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
-from .llm_client import generate_text
-from helpers.blueprints import Blueprint, BeatTemplate, get_blueprint
-from helpers.json_utils import extract_json_block, fallback_block
-from helpers.platform_rules import PlatformConfig, PLATFORM_RULES, DEFAULT_PLATFORM_NAME
-
-
-@dataclass
-class VideoBeat:
-    index: int
-    title: str
-    goal: str
-    t_start: float
-    t_end: float
+from core_logic.llm_client import generate_text
+from core_logic.video_schema import (
+    VideoBeat,
+    VideoPlan,
+    VideoScriptResponse,
+)
 
 
-@dataclass
-class VideoPlan:
-    blueprint_name: str
-    duration_sec: int
-    platform_name: str
-    style: str
-    beats: List[VideoBeat]
+# --------------------------------------------------------------------
+# Request object coming from UI
+# --------------------------------------------------------------------
 
 
 @dataclass
@@ -47,122 +50,161 @@ class VideoRequest:
     extra_context: str = ""
 
 
-@dataclass
-class VideoScriptResponse:
-    plan: VideoPlan
-    beats: List[Dict[str, Any]]  # list of blocks with voiceover, on_screen, shots, broll, captions
-    warnings: List[str]
+# --------------------------------------------------------------------
+# Internal helpers: plan building & prompting
+# --------------------------------------------------------------------
 
 
-# ----- Helpers -----
-
-
-def _get_platform_config(name: str) -> PlatformConfig:
-    if name in PLATFORM_RULES:
-        return PLATFORM_RULES[name]
-    return PLATFORM_RULES[DEFAULT_PLATFORM_NAME]
-
-
-def plan_video(req: VideoRequest) -> VideoPlan:
+def _build_basic_plan(req: VideoRequest) -> VideoPlan:
     """
-    Create a timed video plan (beat schedule) from the request.
-    """
-    bp: Blueprint = get_blueprint(req.blueprint_name)
-    total_duration = max(req.duration_sec, 5)  # sane minimum
+    Build a very simple beat plan based on blueprint and duration.
 
-    total_weight = sum(beat.weight for beat in bp.beats) or 1.0
+    Right now we keep this deterministic and lightweight.
+    Later, you can make this itself LLM-driven if you want.
+    """
+    total = max(req.duration_sec, 5)
+    blueprint = (req.blueprint_name or "short_ad").lower()
+
+    if blueprint == "short_ad":
+        # 3-beat: Hook -> Product -> CTA
+        beats_meta = [
+            ("Hook / Problem", "Hook viewer, show the pain or context.", 0.0, total * 0.33),
+            ("Product Moment", "Show product solving the problem.", total * 0.33, total * 0.66),
+            ("CTA / Finish", "Wrap up and clear CTA.", total * 0.66, total),
+        ]
+    elif blueprint == "ugc_review":
+        # 4-beat: Intro -> Problem -> Experience -> Recommendation
+        beats_meta = [
+            ("Intro / Self", "Introduce the speaker as a real user.", 0.0, total * 0.25),
+            ("Problem", "Describe the problem or frustration.", total * 0.25, total * 0.5),
+            ("Experience", "Explain how using the product felt / helped.", total * 0.5, total * 0.75),
+            ("Recommendation", "Recommend the product and invite viewer to try.", total * 0.75, total),
+        ]
+    else:  # how_to or fallback
+        # 4-beat: Hook -> Step(s) -> Result -> CTA
+        beats_meta = [
+            ("Hook / Promise", "Hook viewer and promise what they will learn.", 0.0, total * 0.25),
+            ("Step-by-step (1)", "Show the first main step.", total * 0.25, total * 0.5),
+            ("Step-by-step (2)", "Show the second main step or refinement.", total * 0.5, total * 0.75),
+            ("Result / CTA", "Show final outcome and clear CTA.", total * 0.75, total),
+        ]
 
     beats: List[VideoBeat] = []
-    t_cursor = 0.0
-
-    for idx, beat_tpl in enumerate(bp.beats):
-        fraction = beat_tpl.weight / total_weight
-        # last beat absorbs any rounding leftovers
-        if idx == len(bp.beats) - 1:
-            t_end = float(total_duration)
-        else:
-            t_end = t_cursor + fraction * total_duration
-
-        beat = VideoBeat(
-            index=idx,
-            title=beat_tpl.title,
-            goal=beat_tpl.goal,
-            t_start=round(t_cursor, 2),
-            t_end=round(t_end, 2),
+    for idx, (title, goal, t_start, t_end) in enumerate(beats_meta):
+        beats.append(
+            VideoBeat(
+                beat_index=idx,
+                title=title,
+                goal=goal,
+                t_start=float(round(t_start, 2)),
+                t_end=float(round(t_end, 2)),
+                voiceover="",    # to be filled by LLM
+                on_screen="",    # to be filled by LLM
+                shots=[],
+                broll=[],
+                captions=[],
+            )
         )
-        beats.append(beat)
-        t_cursor = t_end
 
-    return VideoPlan(
-        blueprint_name=bp.name,
-        duration_sec=total_duration,
+    plan = VideoPlan(
+        blueprint_name=req.blueprint_name,
+        duration_sec=total,
         platform_name=req.platform_name,
         style=req.style,
         beats=beats,
     )
+    return plan
 
 
 def _build_beat_prompt(req: VideoRequest, plan: VideoPlan, beat: VideoBeat) -> str:
     """
-    Build a JSON-focused prompt for one beat.
-
-    Constraints (you can tweak later):
-    - Voiceover <= 18 words
-    - On-screen text <= 36 characters
-    - 3 shots
-    - 2 b-roll ideas
-    - 1–2 caption lines
+    Build an instruction to generate **one beat** as a JSON object.
     """
-    lines = [
-        "You are a creative short-form video scriptwriter.",
-        f"Platform: {plan.platform_name}",
-        f"Style: {plan.style}",
-        "",
-        f"Brand: {req.brand}",
-        f"Product: {req.product}",
-        f"Target audience: {req.audience}",
-        f"Campaign goal: {req.goal}",
-    ]
-    if req.extra_context.strip():
-        lines.append(f"Extra context: {req.extra_context.strip()}")
+    return f"""
+You are helping create a short-form marketing video script.
 
-    lines += [
-        "",
-        f"This video follows a multi-beat structure. You are writing ONLY the beat:",
-        f"- Beat title: {beat.title}",
-        f"- Beat goal: {beat.goal}",
-        f"- Time window: {beat.t_start:.1f}s to {beat.t_end:.1f}s in the video.",
-        "",
-        "Return a single JSON object with EXACTLY these keys:",
-        '  "voiceover"  (string, <= 18 words)',
-        '  "on_screen"  (string, <= 36 characters, like a short overlay text)',
-        '  "shots"      (array of 3 short shot descriptions)',
-        '  "broll"      (array of 2 short b-roll ideas)',
-        '  "captions"   (array of 1–2 short caption strings)',
-        "",
-        "Do not add any extra keys. Do not add explanations or markdown.",
-        "Just output the JSON object.",
-    ]
+Brand: {req.brand}
+Product: {req.product}
+Audience: {req.audience}
+Campaign goal: {req.goal}
+Platform: {req.platform_name}
+Overall style: {req.style}
+Extra context: {req.extra_context}
 
-    return "\n".join(lines)
+We are currently working on one beat of the video:
+
+- Blueprint: {plan.blueprint_name}
+- Beat index: {beat.beat_index}
+- Beat title: {beat.title}
+- Beat goal: {beat.goal}
+- Start time: {beat.t_start} seconds
+- End time: {beat.t_end} seconds
+
+Return **only** a JSON object (no markdown, no backticks) with this shape:
+
+{{
+  "voiceover": "string, the spoken line(s) for this beat",
+  "on_screen": "string, short text shown on screen",
+  "shots": ["list of camera shot ideas, strings"],
+  "broll": ["optional list of B-roll ideas, strings"],
+  "captions": ["optional list of caption lines, strings"]
+}}
+
+The voiceover should match the platform and style, and help achieve the beat goal.
+Keep it concise but vivid.
+""".strip()
 
 
-def script_video_from_plan(
+def _extract_json_from_response(raw: str) -> Dict[str, Any]:
+    """
+    Try to extract a JSON object from the LLM response.
+
+    If it's already plain JSON, parse that.
+    If it's inside a markdown ```json block, extract the inner part.
+    Raises ValueError if parsing fails.
+    """
+    text = raw.strip()
+
+    # Common case: LLM wraps in ```json ... ```
+    if "```" in text:
+        # Take the content between the first pair of ``` blocks
+        parts = text.split("```")
+        # Expected pattern: ["", "json\\n{...}", ""]
+        if len(parts) >= 3:
+            candidate = parts[1]
+            # Strip a leading "json" or "JSON" line
+            candidate = candidate.lstrip().split("\n", 1)
+            if len(candidate) == 2 and candidate[0].lower() in ("json", "json:"):
+                text = candidate[1].strip()
+            else:
+                text = "\n".join(candidate).strip()
+
+    return json.loads(text)
+
+
+# --------------------------------------------------------------------
+# Public API: generate_video_script
+# --------------------------------------------------------------------
+
+
+def generate_video_script(
     req: VideoRequest,
-    plan: VideoPlan,
     debug_first: bool = False,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
+) -> VideoScriptResponse:
     """
-    Call the LLM beat-by-beat to create the video script.
+    Main entry point used by the UI.
 
-    Returns:
-        beats_blocks: list of blocks (one per beat)
-        warnings: list of string messages about any fallbacks used
+    Generates a structured VideoScriptResponse (plan + warnings). The
+    UI can still access:
+        resp.plan
+        resp.beats   (alias for resp.plan.beats)
+        resp.warnings
     """
-    beats_blocks: List[Dict[str, Any]] = []
+    plan = _build_basic_plan(req)
     warnings: List[str] = []
+    beats_out: List[VideoBeat] = []
 
-    for i, beat in enumerate(plan.beats):
+    for idx, beat in enumerate(plan.beats):
         prompt = _build_beat_prompt(req, plan, beat)
 
         raw = generate_text(
@@ -172,56 +214,58 @@ def script_video_from_plan(
             top_p=0.9,
         )
 
-        if debug_first and i == 0:
+        if debug_first and idx == 0:
             print("=== RAW FIRST BEAT RESPONSE ===")
             print(raw)
-            print("================================")
+            print("=" * 32)
 
-        data = extract_json_block(raw)
-        if data is None:
-            warnings.append(
-                f"Beat {i+1} ('{beat.title}') used fallback block due to invalid JSON."
+        try:
+            data = _extract_json_from_response(raw)
+            # Merge structured info into the beat
+            beat_updated = VideoBeat(
+                beat_index=beat.beat_index,
+                title=beat.title,
+                goal=beat.goal,
+                t_start=beat.t_start,
+                t_end=beat.t_end,
+                voiceover=str(data.get("voiceover", "")).strip(),
+                on_screen=str(data.get("on_screen", "")).strip(),
+                shots=list(data.get("shots", []) or []),
+                broll=list(data.get("broll", []) or []),
+                captions=list(data.get("captions", []) or []),
             )
-            data = fallback_block(beat.title)
-
-        # Ensure required keys exist; if missing, fill from fallback
-        required_keys = ["voiceover", "on_screen", "shots", "broll", "captions"]
-        fb = fallback_block(beat.title)
-        for key in required_keys:
-            if key not in data or data[key] in (None, "", []):
-                warnings.append(
-                    f"Beat {i+1} ('{beat.title}') missing key '{key}', using fallback."
+            beats_out.append(beat_updated)
+        except Exception as e:
+            warnings.append(
+                f"Beat {beat.beat_index}: failed to parse JSON from model response ({e})."
+            )
+            # Fallback: keep the original beat with generic placeholders
+            beats_out.append(
+                VideoBeat(
+                    beat_index=beat.beat_index,
+                    title=beat.title,
+                    goal=beat.goal,
+                    t_start=beat.t_start,
+                    t_end=beat.t_end,
+                    voiceover="",
+                    on_screen="",
+                    shots=[],
+                    broll=[],
+                    captions=[],
                 )
-                data[key] = fb[key]
+            )
 
-        # Attach metadata for clarity
-        block = {
-            "beat_index": beat.index,
-            "beat_title": beat.title,
-            "t_start": beat.t_start,
-            "t_end": beat.t_end,
-            "voiceover": data["voiceover"],
-            "on_screen": data["on_screen"],
-            "shots": data["shots"],
-            "broll": data["broll"],
-            "captions": data["captions"],
-        }
-        beats_blocks.append(block)
+    # Construct final structured response
+    final_plan = VideoPlan(
+        blueprint_name=plan.blueprint_name,
+        duration_sec=plan.duration_sec,
+        platform_name=plan.platform_name,
+        style=plan.style,
+        beats=beats_out,
+    )
 
-    return beats_blocks, warnings
-
-
-def generate_video_script(
-    req: VideoRequest,
-    debug_first: bool = False,
-) -> VideoScriptResponse:
-    """
-    Main entry point: plan + script + package response.
-    """
-    plan = plan_video(req)
-    beats_blocks, warnings = script_video_from_plan(req, plan, debug_first=debug_first)
-    return VideoScriptResponse(
-        plan=plan,
-        beats=beats_blocks,
+    resp = VideoScriptResponse(
+        plan=final_plan,
         warnings=warnings,
     )
+    return resp

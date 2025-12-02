@@ -246,37 +246,42 @@ def _generate_video_ui(
         extra_context=extra_context or "",
     )
 
+    # Now returns a VideoScriptResponse (plan + warnings)
     resp = generate_video_script(req, debug_first=bool(debug_first))
 
-    # Build a human-readable storyboard
+    # --- Build human-readable storyboard from structured beats ---
     sb_lines: List[str] = []
-    for block in resp.beats:
+    for beat in resp.beats:  # resp.beats is a list[VideoBeat]
         sb_lines.append(
-            f"Beat {block['beat_index'] + 1}: {block['beat_title']} "
-            f"({block['t_start']}s – {block['t_end']}s)"
+            f"Beat {beat.beat_index + 1}: {beat.title} "
+            f"({beat.t_start}s – {beat.t_end}s)"
         )
-        sb_lines.append(f"  Voiceover: {block['voiceover']}")
-        sb_lines.append(f"  On-screen: {block['on_screen']}")
+        sb_lines.append(f"  Voiceover: {beat.voiceover}")
+        sb_lines.append(f"  On-screen: {beat.on_screen}")
+
         sb_lines.append("  Shots:")
-        for shot in block["shots"]:
+        for shot in beat.shots:
             sb_lines.append(f"    • {shot}")
+
         sb_lines.append("  B-roll:")
-        for br in block["broll"]:
+        for br in beat.broll:
             sb_lines.append(f"    • {br}")
+
         sb_lines.append("  Captions:")
-        for cap in block["captions"]:
+        for cap in beat.captions:
             sb_lines.append(f"    • {cap}")
+
         sb_lines.append("")  # blank line between beats
 
     storyboard_text = "\n".join(sb_lines).strip() or "No beats generated."
 
-    # Warnings text
+    # --- Warnings text ---
     if resp.warnings:
         warnings_text = "\n".join(f"- {w}" for w in resp.warnings)
     else:
         warnings_text = "No warnings. All beats parsed without fallback. ✅"
 
-    # JSON-ready object
+    # --- JSON-ready object for download/integration ---
     script_json: Dict[str, Any] = {
         "plan": {
             "blueprint_name": resp.plan.blueprint_name,
@@ -285,7 +290,7 @@ def _generate_video_ui(
             "style": resp.plan.style,
             "beats": [
                 {
-                    "index": b.index,
+                    "index": b.beat_index,
                     "title": b.title,
                     "goal": b.goal,
                     "t_start": b.t_start,
@@ -294,15 +299,13 @@ def _generate_video_ui(
                 for b in resp.plan.beats
             ],
         },
-        "beats": resp.beats,
+        # Full beats payload with all fields (voiceover, shots, etc.)
+        "beats": [b.model_dump() for b in resp.beats],
         "warnings": resp.warnings,
     }
 
-    return {
-        "storyboard_text": storyboard_text,
-        "script_json": script_json,
-        "warnings_text": warnings_text,
-    }
+    return storyboard_text, script_json, warnings_text
+
 
 
 # ----- Gradio layout -----
